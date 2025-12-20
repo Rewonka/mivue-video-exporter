@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from tkinter import (
     Tk, Frame, Button, Label, Listbox, Scrollbar, END,
-    filedialog, messagebox, StringVar, Toplevel
+    filedialog, messagebox, StringVar, Toplevel, Radiobutton
 )
 from tkinter import ttk
 
@@ -44,7 +44,6 @@ def hms_to_seconds(h: str, m: str, s: str) -> float:
 
 
 def open_in_browser(path: Path) -> None:
-    # Robust open: xdg-open -> firefox fallback
     try:
         p = subprocess.run(["xdg-open", str(path)], capture_output=True, text=True)
         if p.returncode == 0:
@@ -219,15 +218,32 @@ def overlay_segment(
     out_mp4: Path,
     log_cb,
     duration_s: float | None,
+    reduced: bool,
     progress_cb=None,  # progress_cb(seg_ratio 0..1)
 ):
     """
-    Overlay rear (scaled to 1/4 width) onto front.
+    reduced=False (native): keep original resolution + lighter compression
+    reduced=True: scale to 720p + stronger compression + 64k audio
+    rear PiP: scaled to 1/4 width
     """
-    filter_complex = (
-        "[1:v]scale=iw/4:-1[rear];"
-        "[0:v][rear]overlay=10:10:format=auto[v]"
-    )
+    if reduced:
+        # scale front to 720p height, keep aspect (width divisible by 2)
+        filter_complex = (
+            "[0:v]scale=-2:720[front720];"
+            "[1:v]scale=main_w/4:-1[rear];"
+            "[front720][rear]overlay=10:10:format=auto[v]"
+        )
+        crf = "26"
+        preset = "slow"
+        audio_bitrate = "64k"
+    else:
+        filter_complex = (
+            "[1:v]scale=iw/4:-1[rear];"
+            "[0:v][rear]overlay=10:10:format=auto[v]"
+        )
+        crf = "20"
+        preset = "veryfast"
+        audio_bitrate = "128k"
 
     cmd = [
         ffmpeg, "-y",
@@ -237,10 +253,10 @@ def overlay_segment(
         "-map", "[v]",
         "-map", "0:a?",
         "-c:v", "libx264",
-        "-crf", "20",
-        "-preset", "veryfast",
+        "-crf", crf,
+        "-preset", preset,
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", audio_bitrate,
         "-shortest",
         str(out_mp4)
     ]
@@ -269,9 +285,6 @@ def overlay_segment(
 
 
 def concat_mp4(ffmpeg: str, segments: list[Path], out_mp4: Path, log_cb):
-    """
-    Concat demuxer with -c copy. No quotes in list file.
-    """
     list_file = out_mp4.with_suffix(".concat.txt")
     with list_file.open("w", newline="\n") as f:
         for seg in segments:
@@ -325,18 +338,18 @@ class BusyDialog:
     def __init__(self, root: Tk, title="Dolgozom…"):
         self.top = Toplevel(root)
         self.top.title(title)
-        self.top.geometry("560x170")
+        self.top.geometry("600x190")
         self.top.transient(root)
         self.top.grab_set()
 
         self.label_var = StringVar(value="Indítás…")
-        Label(self.top, textvariable=self.label_var, wraplength=540, justify="left").pack(anchor="w", padx=12, pady=(12, 6))
+        Label(self.top, textvariable=self.label_var, wraplength=580, justify="left").pack(anchor="w", padx=12, pady=(12, 6))
 
         self.progress = ttk.Progressbar(self.top, mode="determinate", maximum=100)
         self.progress.pack(fill="x", padx=12, pady=6)
 
         self.detail_var = StringVar(value="")
-        Label(self.top, textvariable=self.detail_var, wraplength=540, justify="left").pack(anchor="w", padx=12)
+        Label(self.top, textvariable=self.detail_var, wraplength=580, justify="left").pack(anchor="w", padx=12)
 
     def set_label(self, text: str):
         self.label_var.set(text)
@@ -389,6 +402,12 @@ class App:
         Button(btns, text="Térkép (kijelölt)", command=self.open_map_for_selection).pack(side="left", padx=12)
         Button(btns, text="Egyesítés (több clip → 1 MP4 + 1 NMEA)", command=self.export_selection).pack(side="left", padx=12)
 
+        # Quality selector (Native vs Reduced)
+        self.quality_mode = StringVar(value="native")
+        Label(btns, text="Minőség:").pack(side="left", padx=(20, 4))
+        Radiobutton(btns, text="Nativ", variable=self.quality_mode, value="native").pack(side="left")
+        Radiobutton(btns, text="Csökkentett (720p + erős tömörítés)", variable=self.quality_mode, value="reduced").pack(side="left", padx=6)
+
         mid = Frame(root)
         mid.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -402,7 +421,7 @@ class App:
 
         bottom = Frame(root)
         bottom.pack(fill="x", padx=10, pady=8)
-        Label(bottom, text="✅ exportálható. ⚠️ hiányos. (Hátsó kamera overlay: 1/4 méret)", wraplength=980, justify="left").pack(anchor="w")
+        Label(bottom, text="✅ exportálható. ⚠️ hiányos. (Hátsó kamera PiP: 1/4 méret)", wraplength=980, justify="left").pack(anchor="w")
 
         # initial log header
         self.log("=== MiVue GUI started ===")
@@ -509,17 +528,21 @@ class App:
             return
         out_dir = Path(out_dir)
 
+        reduced = (self.quality_mode.get() == "reduced")
+
         start_key = clips[0].key
         end_key = clips[-1].key
-        out_mp4 = out_dir / f"COMBINED_{start_key}_to_{end_key}.mp4"
-        out_nmea = out_dir / f"COMBINED_{start_key}_to_{end_key}.nmea"
+        mode_tag = "REDUCED_720P" if reduced else "NATIVE"
+        out_mp4 = out_dir / f"COMBINED_{mode_tag}_{start_key}_to_{end_key}.mp4"
+        out_nmea = out_dir / f"COMBINED_{mode_tag}_{start_key}_to_{end_key}.nmea"
 
         busy = BusyDialog(self.root, title="Export – dolgozom…")
-        busy.set_label("Export folyamat… (a részletek a log fájlban vannak)")
-        busy.set_detail(f"Log: {self.file_logger.latest_path}")
+        busy.set_label("Export folyamat… (részletek a log fájlban)")
+        busy.set_detail(f"Mód: {'Csökkentett 720p' if reduced else 'Nativ'} | Log: {self.file_logger.latest_path}")
         self.root.update_idletasks()
 
         self.log("=== Export start ===")
+        self.log(f"Mode: {'reduced(720p+strong)' if reduced else 'native'}")
         self.log(f"Output MP4: {out_mp4}")
         self.log(f"Output NMEA: {out_nmea}")
 
@@ -531,9 +554,8 @@ class App:
 
                 def make_progress_cb(done_segments: int):
                     def _cb(seg_ratio: float):
-                        # overlay portion: 0..90%
                         overall = (done_segments + seg_ratio) / max(1, total_segments)
-                        pct = overall * 90.0
+                        pct = overall * 90.0  # overlay phase = 0..90%
                         self.root.after(0, lambda p=pct: busy.set_progress(p))
                     return _cb
 
@@ -554,6 +576,7 @@ class App:
                         seg_out,
                         self.log,
                         duration_s=pair.duration_s,
+                        reduced=reduced,
                         progress_cb=make_progress_cb(done),
                     )
                     segments.append(seg_out)
