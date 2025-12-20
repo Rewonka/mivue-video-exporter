@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from tkinter import (
     Tk, Frame, Button, Label, Listbox, Scrollbar, END,
-    filedialog, messagebox, StringVar, Toplevel, Text, Menu
+    filedialog, messagebox, StringVar, Toplevel
 )
 from tkinter import ttk
 
@@ -17,6 +17,9 @@ import folium
 
 PAIR_RE = re.compile(r"^FILE(\d{6})-(\d{6})([FR])\.(MP4|NMEA)$", re.IGNORECASE)
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Parse ffmpeg progress lines: frame= ... time=00:04:59.96 bitrate=...
+TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 
 @dataclass
@@ -36,7 +39,12 @@ def which(cmd: str) -> str | None:
     return _which(cmd)
 
 
+def hms_to_seconds(h: str, m: str, s: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
 def open_in_browser(path: Path) -> None:
+    # Robust open: xdg-open -> firefox fallback
     try:
         p = subprocess.run(["xdg-open", str(path)], capture_output=True, text=True)
         if p.returncode == 0:
@@ -123,6 +131,7 @@ def scan_pairs(normal_dir: Path, ffprobe: str | None) -> list[ClipPair]:
             pairs[key] = ClipPair(key=key, front_mp4=None, rear_mp4=None, front_nmea=None, duration_s=None)
         return pairs[key]
 
+    # Front: MP4 + NMEA
     for p in f_dir.iterdir():
         if not p.is_file():
             continue
@@ -139,6 +148,7 @@ def scan_pairs(normal_dir: Path, ffprobe: str | None) -> list[ClipPair]:
         elif ext == "NMEA":
             pair.front_nmea = p
 
+    # Rear: MP4 only
     for p in r_dir.iterdir():
         if not p.is_file():
             continue
@@ -190,18 +200,32 @@ def concat_nmea(front_nmeas: list[Path], out_nmea: Path):
                     out.write(line.rstrip("\n") + "\n")
 
 
-def run_and_stream(cmd: list[str], log_cb) -> int:
+def run_and_stream(cmd: list[str], log_cb, on_line=None) -> int:
     log_cb(" ".join(cmd))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert p.stdout is not None
     for line in p.stdout:
-        log_cb(line.rstrip("\n"))
+        line = line.rstrip("\n")
+        log_cb(line)
+        if on_line:
+            on_line(line)
     return p.wait()
 
 
-def overlay_segment(ffmpeg: str, front_mp4: Path, rear_mp4: Path, out_mp4: Path, log_cb):
+def overlay_segment(
+    ffmpeg: str,
+    front_mp4: Path,
+    rear_mp4: Path,
+    out_mp4: Path,
+    log_cb,
+    duration_s: float | None,
+    progress_cb=None,  # progress_cb(seg_ratio 0..1)
+):
+    """
+    Overlay rear (scaled to 1/4 width) onto front.
+    """
     filter_complex = (
-        "[1:v]scale=iw/8:-1[rear];"
+        "[1:v]scale=iw/4:-1[rear];"
         "[0:v][rear]overlay=10:10:format=auto[v]"
     )
 
@@ -221,22 +245,36 @@ def overlay_segment(ffmpeg: str, front_mp4: Path, rear_mp4: Path, out_mp4: Path,
         str(out_mp4)
     ]
 
-    rc = run_and_stream(cmd, log_cb)
+    last_ratio = 0.0
+
+    def on_line(line: str):
+        nonlocal last_ratio
+        if not duration_s or duration_s <= 0:
+            return
+        m = TIME_RE.search(line)
+        if not m:
+            return
+        t = hms_to_seconds(m.group(1), m.group(2), m.group(3))
+        ratio = max(0.0, min(1.0, t / duration_s))
+        if ratio > last_ratio + 0.002:
+            last_ratio = ratio
+            if progress_cb:
+                progress_cb(ratio)
+
+    rc = run_and_stream(cmd, log_cb, on_line=on_line)
+    if progress_cb:
+        progress_cb(1.0)
     if rc != 0:
         raise RuntimeError(f"ffmpeg overlay hiba (exit={rc}). Nézd a logot.")
 
 
 def concat_mp4(ffmpeg: str, segments: list[Path], out_mp4: Path, log_cb):
     """
-    Concatenate segments using concat demuxer (-c copy).
-    IMPORTANT: Do NOT wrap paths in double quotes, ffmpeg may treat quotes as literal chars on concat demuxer.
-    We write absolute paths, one per line.
+    Concat demuxer with -c copy. No quotes in list file.
     """
     list_file = out_mp4.with_suffix(".concat.txt")
-
     with list_file.open("w", newline="\n") as f:
         for seg in segments:
-            # absolute path, no quotes
             f.write(f"file {seg.resolve()}\n")
 
     cmd = [
@@ -249,7 +287,6 @@ def concat_mp4(ffmpeg: str, segments: list[Path], out_mp4: Path, log_cb):
     ]
 
     rc = run_and_stream(cmd, log_cb)
-
     try:
         list_file.unlink(missing_ok=True)
     except Exception:
@@ -273,9 +310,7 @@ class FileLogger:
         self.session_path = self.logs_dir / f"mivue_{ts}.log"
         self.latest_path = self.logs_dir / "latest.log"
 
-        # reset latest
         self.latest_path.write_text("", encoding="utf-8")
-
         self._lock = threading.Lock()
 
     def write(self, line: str):
@@ -286,103 +321,25 @@ class FileLogger:
                 f.write(line + "\n")
 
 
-class LogWindow:
-    def __init__(self, root: Tk):
-        self.top = Toplevel(root)
-        self.top.title("Log")
-        self.top.geometry("920x420")
-
-        container = Frame(self.top)
-        container.pack(fill="both", expand=True, padx=8, pady=8)
-
-        self.text = Text(container, wrap="word")
-        self.text.pack(side="left", fill="both", expand=True)
-
-        sb = Scrollbar(container, command=self.text.yview)
-        sb.pack(side="right", fill="y")
-        self.text.config(yscrollcommand=sb.set)
-
-        self.menu = Menu(self.top, tearoff=0)
-        self.menu.add_command(label="Copy", command=self.copy_selection)
-        self.menu.add_command(label="Select all", command=self.select_all)
-
-        self.text.bind("<Button-3>", self._popup_menu)  # right click
-
-        btns = Frame(self.top)
-        btns.pack(fill="x", padx=8, pady=(0, 8))
-
-        ttk.Button(btns, text="Clear", command=self.clear).pack(side="left")
-        ttk.Button(btns, text="Copy selection", command=self.copy_selection).pack(side="left", padx=6)
-        ttk.Button(btns, text="Copy all", command=self.copy_all).pack(side="left", padx=6)
-        ttk.Button(btns, text="Save log as…", command=self.save_as).pack(side="left", padx=6)
-        ttk.Button(btns, text="Close", command=self.top.withdraw).pack(side="right")
-
-        self.text.bind("<Control-a>", self._select_all)
-        self.text.bind("<Control-A>", self._select_all)
-
-    def _popup_menu(self, event):
-        try:
-            self.menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.menu.grab_release()
-
-    def write(self, msg: str):
-        self.text.insert("end", msg + "\n")
-        self.text.see("end")
-
-    def clear(self):
-        self.text.delete("1.0", "end")
-
-    def select_all(self):
-        self.text.tag_add("sel", "1.0", "end")
-
-    def copy_selection(self):
-        try:
-            s = self.text.get("sel.first", "sel.last")
-        except Exception:
-            s = ""
-        if not s:
-            return
-        self.top.clipboard_clear()
-        self.top.clipboard_append(s)
-
-    def copy_all(self):
-        all_text = self.text.get("1.0", "end-1c")
-        self.top.clipboard_clear()
-        self.top.clipboard_append(all_text)
-
-    def save_as(self):
-        content = self.text.get("1.0", "end-1c")
-        path = filedialog.asksaveasfilename(
-            title="Log mentése",
-            defaultextension=".log",
-            filetypes=[("Log file", "*.log"), ("Text file", "*.txt"), ("All files", "*.*")]
-        )
-        if not path:
-            return
-        Path(path).write_text(content, encoding="utf-8", errors="ignore")
-
-    def _select_all(self, _event=None):
-        self.select_all()
-        return "break"
-
-
 class BusyDialog:
     def __init__(self, root: Tk, title="Dolgozom…"):
         self.top = Toplevel(root)
         self.top.title(title)
-        self.top.geometry("520x140")
+        self.top.geometry("560x170")
         self.top.transient(root)
         self.top.grab_set()
 
         self.label_var = StringVar(value="Indítás…")
-        Label(self.top, textvariable=self.label_var, wraplength=500, justify="left").pack(anchor="w", padx=12, pady=(12, 8))
+        Label(self.top, textvariable=self.label_var, wraplength=540, justify="left").pack(anchor="w", padx=12, pady=(12, 6))
 
         self.progress = ttk.Progressbar(self.top, mode="determinate", maximum=100)
         self.progress.pack(fill="x", padx=12, pady=6)
 
         self.detail_var = StringVar(value="")
-        Label(self.top, textvariable=self.detail_var, wraplength=500, justify="left").pack(anchor="w", padx=12)
+        Label(self.top, textvariable=self.detail_var, wraplength=540, justify="left").pack(anchor="w", padx=12)
+
+    def set_label(self, text: str):
+        self.label_var.set(text)
 
     def set_detail(self, text: str):
         self.detail_var.set(text)
@@ -416,26 +373,21 @@ class App:
         self.base_dir: Path | None = None
         self.pairs: list[ClipPair] = []
 
-        self.log_window = LogWindow(root)
-        self.log_window.top.withdraw()
-
         self.ui_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._poll_ui_queue()
 
         top = Frame(root)
         top.pack(fill="x", padx=10, pady=10)
 
-        self.status = StringVar(value="Válaszd ki a Normal mappát. Többet is kijelölhetsz (Ctrl/Shift).")
+        self.status = StringVar(value=f"Válaszd ki a Normal mappát. Log: {self.file_logger.latest_path}")
         Label(top, textvariable=self.status, wraplength=980, justify="left").pack(anchor="w")
 
         btns = Frame(root)
         btns.pack(fill="x", padx=10, pady=5)
 
         Button(btns, text="Mappa (Normal/)", command=self.pick_dir).pack(side="left")
-        Button(btns, text="Log megnyitása", command=self.show_log).pack(side="left", padx=6)
-
-        Button(btns, text="Térkép (kijelölt)", command=self.open_map_for_selection).pack(side="left", padx=18)
-        Button(btns, text="Egyesítés (több clip → 1 MP4 + 1 NMEA)", command=self.export_selection).pack(side="left", padx=18)
+        Button(btns, text="Térkép (kijelölt)", command=self.open_map_for_selection).pack(side="left", padx=12)
+        Button(btns, text="Egyesítés (több clip → 1 MP4 + 1 NMEA)", command=self.export_selection).pack(side="left", padx=12)
 
         mid = Frame(root)
         mid.pack(fill="both", expand=True, padx=10, pady=10)
@@ -450,28 +402,17 @@ class App:
 
         bottom = Frame(root)
         bottom.pack(fill="x", padx=10, pady=8)
-        Label(
-            bottom,
-            text=f"✅ = exportálható. ⚠️ = hiányos. Log fájl: {self.file_logger.latest_path}",
-            wraplength=980,
-            justify="left"
-        ).pack(anchor="w")
+        Label(bottom, text="✅ exportálható. ⚠️ hiányos. (Hátsó kamera overlay: 1/4 méret)", wraplength=980, justify="left").pack(anchor="w")
 
         # initial log header
-        self.log(f"=== MiVue GUI started ===")
+        self.log("=== MiVue GUI started ===")
         self.log(f"Session log: {self.file_logger.session_path}")
         self.log(f"Latest log:  {self.file_logger.latest_path}")
         self.log(f"ffmpeg: {self.ffmpeg}")
         self.log(f"ffprobe:{self.ffprobe}")
 
-    def show_log(self):
-        self.log_window.top.deiconify()
-        self.log_window.top.lift()
-
     def log(self, msg: str):
-        # write to file immediately + to UI via queue
         self.file_logger.write(msg)
-        self.ui_queue.put(("log", msg))
 
     def set_status(self, msg: str):
         self.ui_queue.put(("status", msg))
@@ -480,13 +421,11 @@ class App:
         try:
             while True:
                 kind, payload = self.ui_queue.get_nowait()
-                if kind == "log":
-                    self.log_window.write(payload)
-                elif kind == "status":
+                if kind == "status":
                     self.status.set(payload)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_ui_queue)
+        self.root.after(80, self._poll_ui_queue)
 
     def pick_dir(self):
         d = filedialog.askdirectory(title="Válaszd ki a Normal mappát")
@@ -494,7 +433,7 @@ class App:
             return
         try:
             self.base_dir = Path(d)
-            self.set_status("Beolvasás… (fájlok + hossz lekérdezés ffprobe-bal)")
+            self.set_status("Beolvasás… (fájlok + hossz ffprobe)")
             self.root.update_idletasks()
 
             self.pairs = scan_pairs(self.base_dir, self.ffprobe)
@@ -516,12 +455,12 @@ class App:
                 )
 
             self.set_status(
-                f"Betöltve: {self.base_dir} | Clip-ek: {len(self.pairs)} | "
-                f"Össz-idő (ismert): {fmt_duration(total_known)}"
+                f"Betöltve: {self.base_dir} | Clip-ek: {len(self.pairs)} | Össz-idő(ismert): {fmt_duration(total_known)} | Log: {self.file_logger.latest_path}"
             )
             self.log(f"Selected Normal dir: {self.base_dir}")
 
         except Exception as e:
+            self.log(f"Pick dir error: {e}")
             messagebox.showerror("Hiba", str(e))
 
     def get_selected_pairs(self) -> list[ClipPair]:
@@ -576,7 +515,10 @@ class App:
         out_nmea = out_dir / f"COMBINED_{start_key}_to_{end_key}.nmea"
 
         busy = BusyDialog(self.root, title="Export – dolgozom…")
-        self.show_log()
+        busy.set_label("Export folyamat… (a részletek a log fájlban vannak)")
+        busy.set_detail(f"Log: {self.file_logger.latest_path}")
+        self.root.update_idletasks()
+
         self.log("=== Export start ===")
         self.log(f"Output MP4: {out_mp4}")
         self.log(f"Output NMEA: {out_nmea}")
@@ -585,46 +527,57 @@ class App:
             try:
                 workdir = Path(tempfile.mkdtemp(prefix="mivue_"))
                 segments: list[Path] = []
+                total_segments = len(clips)
 
-                total_steps = len(clips) + 2
-                step = 0
+                def make_progress_cb(done_segments: int):
+                    def _cb(seg_ratio: float):
+                        # overlay portion: 0..90%
+                        overall = (done_segments + seg_ratio) / max(1, total_segments)
+                        pct = overall * 90.0
+                        self.root.after(0, lambda p=pct: busy.set_progress(p))
+                    return _cb
 
                 for i, pair in enumerate(clips, start=1):
-                    step += 1
-                    pct = (step / total_steps) * 100.0
-                    self.set_status(f"Export: overlay {i}/{len(clips)} …")
-                    self.log(f"--- Overlay {i}/{len(clips)}: {pair.key} ---")
+                    done = i - 1
+                    self.set_status(f"Export: overlay {i}/{total_segments} … | Log: {self.file_logger.latest_path}")
+                    self.log(f"--- Overlay {i}/{total_segments}: {pair.key} ---")
                     self.log(f"Front: {pair.front_mp4}")
                     self.log(f"Rear : {pair.rear_mp4}")
 
-                    self.root.after(0, lambda p=pct, i=i: (busy.set_progress(p), busy.set_detail(f"Szegmens: {i}/{len(clips)}")))
+                    self.root.after(0, lambda i=i, ts=total_segments: busy.set_detail(f"Szegmens: {i}/{ts} (overlay)"))
 
                     seg_out = workdir / f"seg_{i:04d}_{pair.key}.mp4"
-                    overlay_segment(self.ffmpeg, pair.front_mp4, pair.rear_mp4, seg_out, self.log)
+                    overlay_segment(
+                        self.ffmpeg,
+                        pair.front_mp4,
+                        pair.rear_mp4,
+                        seg_out,
+                        self.log,
+                        duration_s=pair.duration_s,
+                        progress_cb=make_progress_cb(done),
+                    )
                     segments.append(seg_out)
 
-                step += 1
-                pct = (step / total_steps) * 100.0
-                self.set_status("Export: szegmensek összefűzése (concat)…")
-                self.root.after(0, lambda p=pct: (busy.set_progress(p), busy.set_detail("Összefűzés (concat)…")))
+                # concat 90..97
+                self.set_status(f"Export: concat… | Log: {self.file_logger.latest_path}")
+                self.root.after(0, lambda: (busy.set_progress(92), busy.set_detail("Összefűzés (concat)…")))
                 concat_mp4(self.ffmpeg, segments, out_mp4, self.log)
+                self.root.after(0, lambda: busy.set_progress(97))
 
-                step += 1
-                pct = (step / total_steps) * 100.0
-                self.set_status("Export: NMEA összefűzés…")
-                self.root.after(0, lambda p=pct: (busy.set_progress(p), busy.set_detail("NMEA összefűzés…")))
+                # nmea 97..100
+                self.set_status(f"Export: NMEA… | Log: {self.file_logger.latest_path}")
+                self.root.after(0, lambda: (busy.set_progress(97), busy.set_detail("NMEA összefűzés…")))
                 concat_nmea([p.front_nmea for p in clips if p.front_nmea], out_nmea)
+                self.root.after(0, lambda: busy.set_progress(100))
 
-                self.set_status(f"Kész! {out_mp4.name} + {out_nmea.name}")
-                self.root.after(0, lambda: (busy.set_progress(100), busy.set_detail("Kész!")))
-
+                self.set_status(f"Kész! {out_mp4.name} + {out_nmea.name} | Log: {self.file_logger.latest_path}")
                 self.log("=== Export done ===")
                 self.root.after(0, lambda: (busy.close(), messagebox.showinfo("Kész", f"Mentve:\n{out_mp4}\n{out_nmea}\n\nLog: {self.file_logger.latest_path}")))
 
             except Exception as e:
                 err = str(e)
                 self.log(f"!!! Export error: {err}")
-                self.root.after(0, lambda err=err: (self.show_log(), busy.close(), messagebox.showerror("Hiba", f"{err}\n\nLog: {self.file_logger.latest_path}")))
+                self.root.after(0, lambda err=err: (busy.close(), messagebox.showerror("Hiba", f"{err}\n\nLog: {self.file_logger.latest_path}")))
 
         threading.Thread(target=worker, daemon=True).start()
 
