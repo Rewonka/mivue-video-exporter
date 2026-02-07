@@ -133,13 +133,41 @@ def run_and_stream(cmd: list[str], log_cb, on_line=None) -> int:
     return p.wait()
 
 
-def scan_pairs(normal_dir: Path, ffprobe: str | None) -> list[ClipPair]:
+def scan_pairs(
+    normal_dir: Path,
+    ffprobe: str | None,
+    progress_cb=None,
+    detail_cb=None,
+) -> list[ClipPair]:
     f_dir = normal_dir / "F"
     r_dir = normal_dir / "R"
     if not f_dir.exists() or not r_dir.exists():
         raise FileNotFoundError("A kiválasztott mappában nem találom az F/ és R/ könyvtárakat (Normal/F és Normal/R).")
 
+    f_files = [p for p in f_dir.iterdir() if p.is_file()]
+    r_files = [p for p in r_dir.iterdir() if p.is_file()]
+
     pairs: dict[str, ClipPair] = {}
+    front_mp4_candidates = 0
+    for p in f_files:
+        m = PAIR_RE.match(p.name)
+        if not m:
+            continue
+        cam = m.group(3).upper()
+        ext = m.group(4).upper()
+        if cam == "F" and ext == "MP4":
+            front_mp4_candidates += 1
+
+    total_steps = len(f_files) + len(r_files) + (front_mp4_candidates if ffprobe else 0)
+    done_steps = 0
+
+    def report(detail: str | None = None):
+        nonlocal done_steps
+        done_steps += 1
+        if progress_cb:
+            progress_cb(done_steps, max(1, total_steps))
+        if detail_cb and detail:
+            detail_cb(detail)
 
     def ensure(key: str) -> ClipPair:
         if key not in pairs:
@@ -147,14 +175,14 @@ def scan_pairs(normal_dir: Path, ffprobe: str | None) -> list[ClipPair]:
         return pairs[key]
 
     # Front: MP4 + NMEA
-    for p in f_dir.iterdir():
-        if not p.is_file():
-            continue
+    for p in f_files:
         m = PAIR_RE.match(p.name)
         if not m:
+            report(f"F: {p.name}")
             continue
         yymmdd, hhmmss, cam, ext = m.group(1), m.group(2), m.group(3).upper(), m.group(4).upper()
         if cam != "F":
+            report(f"F: {p.name}")
             continue
         key = f"{yymmdd}-{hhmmss}"
         pair = ensure(key)
@@ -162,20 +190,22 @@ def scan_pairs(normal_dir: Path, ffprobe: str | None) -> list[ClipPair]:
             pair.front_mp4 = p
         elif ext == "NMEA":
             pair.front_nmea = p
+        report(f"F: {p.name}")
 
     # Rear: MP4 only
-    for p in r_dir.iterdir():
-        if not p.is_file():
-            continue
+    for p in r_files:
         m = PAIR_RE.match(p.name)
         if not m:
+            report(f"R: {p.name}")
             continue
         yymmdd, hhmmss, cam, ext = m.group(1), m.group(2), m.group(3).upper(), m.group(4).upper()
         if cam != "R" or ext != "MP4":
+            report(f"R: {p.name}")
             continue
         key = f"{yymmdd}-{hhmmss}"
         pair = ensure(key)
         pair.rear_mp4 = p
+        report(f"R: {p.name}")
 
     out = [pairs[k] for k in sorted(pairs.keys())]
 
@@ -183,6 +213,7 @@ def scan_pairs(normal_dir: Path, ffprobe: str | None) -> list[ClipPair]:
         for pair in out:
             if pair.front_mp4 and pair.duration_s is None:
                 pair.duration_s = ffprobe_duration(ffprobe, pair.front_mp4)
+                report(f"ffprobe: {pair.front_mp4.name}")
 
     return out
 
@@ -810,51 +841,176 @@ def render_map_video_from_track(
 # App
 # -----------------------------
 
+I18N = {
+    "hu": {
+        "app_title": "MiVue 798D + A30 – Egyszerű Viewer/Exporter",
+        "error_title": "Hiba",
+        "info_title": "Info",
+        "done_title": "Kész",
+        "missing_ffmpeg": "Nem találom az ffmpeg-et a PATH-ban. Telepítsd: sudo apt install ffmpeg",
+        "missing_ffprobe": "Nem találom az ffprobe-ot a PATH-ban. Telepítsd: sudo apt install ffmpeg",
+        "initial_status": "Válaszd ki a Normal mappát. Log: {log}",
+        "btn_pick_dir": "Mappa (Normal/)",
+        "btn_map_video": "Térkép videó (kijelölt)",
+        "btn_map_html": "Térkép HTML (kijelölt)",
+        "btn_export": "Egyesítés (több clip → 1 MP4 + 1 NMEA)",
+        "quality_label": "Minőség:",
+        "quality_native": "Nativ",
+        "quality_reduced": "Csökkentett (720p + strong)",
+        "map_overlay_checkbox": "Map overlay exportnál",
+        "language_label": "Nyelv / Language:",
+        "language_hu": "Magyar",
+        "language_en": "English",
+        "bottom_hint": "✅ exportálható. ⚠️ hiányos. Rear PiP: main_w/4. Map video: OSM tiles + 5fps. Log: ./logs/latest.log",
+        "pick_normal_title": "Válaszd ki a Normal mappát",
+        "pick_output_title": "Hova mentsem a végső eredményt?",
+        "status_scanning": "Beolvasás… (fájlok + hossz ffprobe)",
+        "status_loaded": "Betöltve: {base_dir} | Clip-ek: {count} | Össz-idő(ismert): {duration} | Log: {log}",
+        "status_export_overlay": "Export: overlay {i}/{total} … | Log: {log}",
+        "status_export_concat": "Export: concat… | Log: {log}",
+        "status_export_nmea": "Export: NMEA… | Log: {log}",
+        "status_done": "Kész! {mp4} + {nmea} | Log: {log}",
+        "msg_select_at_least_one": "Jelölj ki legalább 1 elemet.",
+        "msg_no_front_nmea": "A kijelöltek között nincs Front .NMEA.",
+        "msg_need_complete_clips_for_map": "Ehhez válassz ✅ clip(ek)et (front MP4 + rear MP4 + front NMEA).",
+        "msg_no_exportable_clip": "A kijelöltek között nincs exportálható (✅) clip.",
+        "msg_unknown_duration": "Nem tudom a hosszát: {path}",
+        "msg_map_video_done": "Térképes videó elkészült:\n{out_mp4}\n\nLog: {log}",
+        "msg_export_saved": "Mentve:\n{out_mp4}\n{out_nmea}\n\nLog: {log}",
+        "busy_map_title": "Térkép videó – dolgozom…",
+        "busy_map_label": "Térképes videó készítése (OSM) – részletek a log fájlban",
+        "busy_map_detail": "Szegmensek: {segments} | Méret: {w}x{h} | FPS: 5 | Hossz: {duration}",
+        "busy_scan_title": "Beolvasás – dolgozom…",
+        "busy_scan_label": "Könyvtár beolvasása (fájlok + ffprobe hossz)",
+        "busy_scan_detail": "Előkészítés…",
+        "busy_scan_detail_current": "Aktuális: {detail}",
+        "busy_export_title": "Export – dolgozom…",
+        "busy_export_label": "Export folyamat… (részletek a log fájlban)",
+        "busy_export_detail": "Mód: {mode} | Map overlay: {overlay}",
+        "busy_export_mode_native": "Nativ",
+        "busy_export_mode_reduced": "Csökkentett 720p",
+        "busy_generating_map": "Map videó generálás (teljes út)…",
+        "busy_segment": "Szegmens: {i}/{total} (rear+map overlay)",
+        "busy_concat": "Összefűzés (concat)…",
+        "busy_nmea": "NMEA összefűzés…",
+        "clip_row": "{marker} {key} | dur:{dur} | Fmp4:{fmp4} Rmp4:{rmp4} Fnmea:{fnmea}",
+    },
+    "en": {
+        "app_title": "MiVue 798D + A30 - Simple Viewer/Exporter",
+        "error_title": "Error",
+        "info_title": "Info",
+        "done_title": "Done",
+        "missing_ffmpeg": "ffmpeg was not found in PATH. Install it: sudo apt install ffmpeg",
+        "missing_ffprobe": "ffprobe was not found in PATH. Install it: sudo apt install ffmpeg",
+        "initial_status": "Select the Normal folder. Log: {log}",
+        "btn_pick_dir": "Folder (Normal/)",
+        "btn_map_video": "Map video (selected)",
+        "btn_map_html": "Map HTML (selected)",
+        "btn_export": "Merge (multiple clips -> 1 MP4 + 1 NMEA)",
+        "quality_label": "Quality:",
+        "quality_native": "Native",
+        "quality_reduced": "Reduced (720p + strong)",
+        "map_overlay_checkbox": "Map overlay during export",
+        "language_label": "Language:",
+        "language_hu": "Hungarian",
+        "language_en": "English",
+        "bottom_hint": "✅ exportable. ⚠️ incomplete. Rear PiP: main_w/4. Map video: OSM tiles + 5fps. Log: ./logs/latest.log",
+        "pick_normal_title": "Select the Normal folder",
+        "pick_output_title": "Where should I save the final output?",
+        "status_scanning": "Scanning... (files + duration via ffprobe)",
+        "status_loaded": "Loaded: {base_dir} | Clips: {count} | Total known duration: {duration} | Log: {log}",
+        "status_export_overlay": "Export: overlay {i}/{total} ... | Log: {log}",
+        "status_export_concat": "Export: concat... | Log: {log}",
+        "status_export_nmea": "Export: NMEA... | Log: {log}",
+        "status_done": "Done! {mp4} + {nmea} | Log: {log}",
+        "msg_select_at_least_one": "Select at least 1 item.",
+        "msg_no_front_nmea": "No front .NMEA found in the selection.",
+        "msg_need_complete_clips_for_map": "Select ✅ clips (front MP4 + rear MP4 + front NMEA).",
+        "msg_no_exportable_clip": "No exportable (✅) clip in the selection.",
+        "msg_unknown_duration": "Cannot determine duration: {path}",
+        "msg_map_video_done": "Map video created:\n{out_mp4}\n\nLog: {log}",
+        "msg_export_saved": "Saved:\n{out_mp4}\n{out_nmea}\n\nLog: {log}",
+        "busy_map_title": "Map video - working...",
+        "busy_map_label": "Creating map video (OSM) - see details in the log file",
+        "busy_map_detail": "Segments: {segments} | Size: {w}x{h} | FPS: 5 | Duration: {duration}",
+        "busy_scan_title": "Scanning - working...",
+        "busy_scan_label": "Scanning folder (files + ffprobe duration)",
+        "busy_scan_detail": "Preparing...",
+        "busy_scan_detail_current": "Current: {detail}",
+        "busy_export_title": "Export - working...",
+        "busy_export_label": "Export in progress... (details in the log file)",
+        "busy_export_detail": "Mode: {mode} | Map overlay: {overlay}",
+        "busy_export_mode_native": "Native",
+        "busy_export_mode_reduced": "Reduced 720p",
+        "busy_generating_map": "Generating map video (full route)...",
+        "busy_segment": "Segment: {i}/{total} (rear+map overlay)",
+        "busy_concat": "Concatenating...",
+        "busy_nmea": "Concatenating NMEA...",
+        "clip_row": "{marker} {key} | dur:{dur} | Fmp4:{fmp4} Rmp4:{rmp4} Fnmea:{fnmea}",
+    },
+}
+
 class App:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("MiVue 798D + A30 – Simple Viewer/Exporter")
+        self.lang = StringVar(value="en")
+        self.root.title(self.tr("app_title"))
 
         self.ffmpeg = which("ffmpeg")
         self.ffprobe = which("ffprobe")
 
         if not self.ffmpeg:
-            messagebox.showerror("Hiba", "Nem találom az ffmpeg-et a PATH-ban. Telepítsd: sudo apt install ffmpeg")
+            messagebox.showerror(self.tr("error_title"), self.tr("missing_ffmpeg"))
             root.destroy()
             return
         if not self.ffprobe:
-            messagebox.showerror("Hiba", "Nem találom az ffprobe-ot a PATH-ban. Telepítsd: sudo apt install ffmpeg")
+            messagebox.showerror(self.tr("error_title"), self.tr("missing_ffprobe"))
             root.destroy()
             return
 
         self.file_logger = FileLogger()
         self.base_dir: Path | None = None
         self.pairs: list[ClipPair] = []
+        self.total_known_duration = 0.0
         self.ui_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._poll_ui_queue()
 
         top = Frame(root)
         top.pack(fill="x", padx=10, pady=10)
 
-        self.status = StringVar(value=f"Válaszd ki a Normal mappát. Log: {self.file_logger.latest_path}")
+        self.status = StringVar(value=self.tr("initial_status", log=self.file_logger.latest_path))
         Label(top, textvariable=self.status, wraplength=980, justify="left").pack(anchor="w")
 
         btns = Frame(root)
         btns.pack(fill="x", padx=10, pady=5)
 
-        Button(btns, text="Mappa (Normal/)", command=self.pick_dir).pack(side="left")
-        Button(btns, text="Térkép videó (kijelölt)", command=self.make_map_video_for_selection).pack(side="left", padx=10)
-        Button(btns, text="Térkép HTML (kijelölt)", command=self.open_map_for_selection).pack(side="left", padx=10)
-        Button(btns, text="Egyesítés (több clip → 1 MP4 + 1 NMEA)", command=self.export_selection).pack(side="left", padx=10)
+        self.btn_pick_dir = Button(btns, command=self.pick_dir)
+        self.btn_pick_dir.pack(side="left")
+        self.btn_map_video = Button(btns, command=self.make_map_video_for_selection)
+        self.btn_map_video.pack(side="left", padx=10)
+        self.btn_map_html = Button(btns, command=self.open_map_for_selection)
+        self.btn_map_html.pack(side="left", padx=10)
+        self.btn_export = Button(btns, command=self.export_selection)
+        self.btn_export.pack(side="left", padx=10)
 
         self.quality_mode = StringVar(value="native")
-        Label(btns, text="Minőség:").pack(side="left", padx=(18, 4))
-        Radiobutton(btns, text="Nativ", variable=self.quality_mode, value="native").pack(side="left")
-        Radiobutton(btns, text="Csökkentett (720p + strong)", variable=self.quality_mode, value="reduced").pack(side="left", padx=6)
+        self.lbl_quality = Label(btns)
+        self.lbl_quality.pack(side="left", padx=(18, 4))
+        self.rb_native = Radiobutton(btns, variable=self.quality_mode, value="native")
+        self.rb_native.pack(side="left")
+        self.rb_reduced = Radiobutton(btns, variable=self.quality_mode, value="reduced")
+        self.rb_reduced.pack(side="left", padx=6)
 
-        # Map overlay toggle for export
         self.map_overlay_enabled = BooleanVar(value=True)
-        ttk.Checkbutton(btns, text="Map overlay exportnál", variable=self.map_overlay_enabled).pack(side="left", padx=(18, 0))
+        self.chk_map_overlay = ttk.Checkbutton(btns, variable=self.map_overlay_enabled)
+        self.chk_map_overlay.pack(side="left", padx=(18, 0))
+
+        self.lang_flags = Frame(btns)
+        self.lang_flags.pack(side="left", padx=(18, 0))
+        self.btn_lang_hu = Button(self.lang_flags, text="🇭🇺", command=lambda: self.set_language("hu"), width=3)
+        self.btn_lang_hu.pack(side="left")
+        self.btn_lang_en = Button(self.lang_flags, text="🇬🇧", command=lambda: self.set_language("en"), width=3)
+        self.btn_lang_en.pack(side="left", padx=4)
 
         mid = Frame(root)
         mid.pack(fill="both", expand=True, padx=10, pady=10)
@@ -869,14 +1025,94 @@ class App:
 
         bottom = Frame(root)
         bottom.pack(fill="x", padx=10, pady=8)
-        Label(bottom, text="✅ exportálható. ⚠️ hiányos. Rear PiP: main_w/4. Map video: OSM tiles + 5fps. Log: ./logs/latest.log",
-              wraplength=980, justify="left").pack(anchor="w")
+        self.lbl_hint = Label(bottom, wraplength=980, justify="left")
+        self.lbl_hint.pack(anchor="w")
+
+        self.refresh_texts()
 
         self.log("=== MiVue GUI started ===")
         self.log(f"Session log: {self.file_logger.session_path}")
         self.log(f"Latest log:  {self.file_logger.latest_path}")
         self.log(f"ffmpeg: {self.ffmpeg}")
         self.log(f"ffprobe:{self.ffprobe}")
+
+    def tr(self, msg_id: str, **kwargs) -> str:
+        lang = self.lang.get() if self.lang.get() in I18N else "hu"
+        text = I18N[lang].get(msg_id, msg_id)
+        return text.format(**kwargs) if kwargs else text
+
+    def tr_err(self, msg: str) -> str:
+        if self.lang.get() != "en":
+            return msg
+        replacements = [
+            (
+                "A kiválasztott mappában nem találom az F/ és R/ könyvtárakat (Normal/F és Normal/R).",
+                "The selected folder does not contain F/ and R/ directories (Normal/F and Normal/R).",
+            ),
+            (
+                "Nem találtam használható $GPRMC koordinátákat ebben a .NMEA fájlban.",
+                "No usable $GPRMC coordinates were found in this .NMEA file.",
+            ),
+            ("Nem tudom a hosszát: ", "Cannot determine duration: "),
+            ("Kevés GPS pont a kombinált track-ben.", "Too few GPS points in the combined track."),
+            ("Kevés GPS pont a kombinált track-ben (export map).", "Too few GPS points in the combined track (export map)."),
+            ("Nem sikerült letölteni tile-t:", "Failed to download tile:"),
+            (
+                "Hiányzik a numpy vagy pillow. Telepítés: pip install numpy pillow",
+                "numpy or pillow is missing. Install: pip install numpy pillow",
+            ),
+            ("ffmpeg overlay hiba", "ffmpeg overlay error"),
+            ("ffmpeg concat hiba", "ffmpeg concat error"),
+            ("ffmpeg map encode hiba", "ffmpeg map encode error"),
+        ]
+        out = msg
+        for hu, en in replacements:
+            out = out.replace(hu, en)
+        return out
+
+    def set_language(self, lang: str):
+        if lang not in I18N:
+            return
+        if self.lang.get() == lang:
+            return
+        self.lang.set(lang)
+        self.on_language_change()
+
+    def on_language_change(self):
+        self.refresh_texts()
+        self.refresh_status()
+
+    def refresh_texts(self):
+        self.root.title(self.tr("app_title"))
+        self.btn_pick_dir.config(text=self.tr("btn_pick_dir"))
+        self.btn_map_video.config(text=self.tr("btn_map_video"))
+        self.btn_map_html.config(text=self.tr("btn_map_html"))
+        self.btn_export.config(text=self.tr("btn_export"))
+        self.lbl_quality.config(text=self.tr("quality_label"))
+        self.rb_native.config(text=self.tr("quality_native"))
+        self.rb_reduced.config(text=self.tr("quality_reduced"))
+        self.chk_map_overlay.config(text=self.tr("map_overlay_checkbox"))
+        self.lbl_hint.config(text=self.tr("bottom_hint"))
+        self._refresh_language_flag_state()
+
+    def _refresh_language_flag_state(self):
+        selected = self.lang.get()
+        self.btn_lang_hu.config(relief="sunken" if selected == "hu" else "raised")
+        self.btn_lang_en.config(relief="sunken" if selected == "en" else "raised")
+
+    def refresh_status(self):
+        if self.base_dir is None:
+            self.set_status(self.tr("initial_status", log=self.file_logger.latest_path))
+            return
+        self.set_status(
+            self.tr(
+                "status_loaded",
+                base_dir=self.base_dir,
+                count=len(self.pairs),
+                duration=fmt_duration(self.total_known_duration),
+                log=self.file_logger.latest_path,
+            )
+        )
 
     def log(self, msg: str):
         self.file_logger.write(msg)
@@ -895,40 +1131,68 @@ class App:
         self.root.after(80, self._poll_ui_queue)
 
     def pick_dir(self):
-        d = filedialog.askdirectory(title="Válaszd ki a Normal mappát")
+        d = filedialog.askdirectory(title=self.tr("pick_normal_title"))
         if not d:
             return
-        try:
-            self.base_dir = Path(d)
-            self.set_status("Beolvasás… (fájlok + hossz ffprobe)")
-            self.root.update_idletasks()
+        self.base_dir = Path(d)
+        self.set_status(self.tr("status_scanning"))
+        self.root.update_idletasks()
 
-            self.pairs = scan_pairs(self.base_dir, self.ffprobe)
-            self.listbox.delete(0, END)
+        busy = BusyDialog(self.root, title=self.tr("busy_scan_title"))
+        busy.set_label(self.tr("busy_scan_label"))
+        busy.set_detail(self.tr("busy_scan_detail"))
+        busy.set_progress(0)
 
-            total_known = 0.0
-            for pair in self.pairs:
-                marker = "✅" if pair.complete() else "⚠️"
-                dur = fmt_duration(pair.duration_s)
-                if pair.duration_s is not None:
-                    total_known += pair.duration_s
+        def on_progress(done: int, total: int):
+            self.root.after(0, lambda d=done, t=total: busy.set_progress((d / max(1, t)) * 100.0))
 
-                self.listbox.insert(
-                    END,
-                    f"{marker} {pair.key} | dur:{dur} | "
-                    f"Fmp4:{'Y' if pair.front_mp4 else 'N'} "
-                    f"Rmp4:{'Y' if pair.rear_mp4 else 'N'} "
-                    f"Fnmea:{'Y' if pair.front_nmea else 'N'}"
+        def on_detail(detail: str):
+            self.root.after(0, lambda txt=detail: busy.set_detail(self.tr("busy_scan_detail_current", detail=txt)))
+
+        def worker():
+            try:
+                pairs = scan_pairs(self.base_dir, self.ffprobe, progress_cb=on_progress, detail_cb=on_detail)
+                total_known = sum((p.duration_s or 0.0) for p in pairs)
+
+                def finish_ok():
+                    try:
+                        self.pairs = pairs
+                        self.listbox.delete(0, END)
+                        for pair in self.pairs:
+                            marker = "✅" if pair.complete() else "⚠️"
+                            dur = fmt_duration(pair.duration_s)
+                            self.listbox.insert(
+                                END,
+                                self.tr(
+                                    "clip_row",
+                                    marker=marker,
+                                    key=pair.key,
+                                    dur=dur,
+                                    fmp4="Y" if pair.front_mp4 else "N",
+                                    rmp4="Y" if pair.rear_mp4 else "N",
+                                    fnmea="Y" if pair.front_nmea else "N",
+                                ),
+                            )
+
+                        self.total_known_duration = total_known
+                        self.refresh_status()
+                        self.log(f"Selected Normal dir: {self.base_dir}")
+                    finally:
+                        busy.close()
+
+                self.root.after(0, finish_ok)
+            except Exception as e:
+                err = str(e)
+                self.log(f"Pick dir error: {err}")
+                self.root.after(
+                    0,
+                    lambda: (
+                        busy.close(),
+                        messagebox.showerror(self.tr("error_title"), self.tr_err(err)),
+                    ),
                 )
 
-            self.set_status(
-                f"Betöltve: {self.base_dir} | Clip-ek: {len(self.pairs)} | Össz-idő(ismert): {fmt_duration(total_known)} | Log: {self.file_logger.latest_path}"
-            )
-            self.log(f"Selected Normal dir: {self.base_dir}")
-
-        except Exception as e:
-            self.log(f"Pick dir error: {e}")
-            messagebox.showerror("Hiba", str(e))
+        threading.Thread(target=worker, daemon=True).start()
 
     def get_selected_pairs(self) -> list[ClipPair]:
         if not self.pairs:
@@ -939,12 +1203,12 @@ class App:
     def open_map_for_selection(self):
         sel = self.get_selected_pairs()
         if not sel:
-            messagebox.showinfo("Info", "Jelölj ki legalább 1 elemet.")
+            messagebox.showinfo(self.tr("info_title"), self.tr("msg_select_at_least_one"))
             return
 
         nmeas = [p.front_nmea for p in sel if p.front_nmea]
         if not nmeas:
-            messagebox.showerror("Hiba", "A kijelöltek között nincs Front .NMEA.")
+            messagebox.showerror(self.tr("error_title"), self.tr("msg_no_front_nmea"))
             return
 
         try:
@@ -956,17 +1220,17 @@ class App:
             open_in_browser(out_html)
         except Exception as e:
             self.log(f"Map HTML error: {e}")
-            messagebox.showerror("Hiba", str(e))
+            messagebox.showerror(self.tr("error_title"), self.tr_err(str(e)))
 
     def make_map_video_for_selection(self):
         sel = self.get_selected_pairs()
         if not sel:
-            messagebox.showinfo("Info", "Jelölj ki legalább 1 elemet.")
+            messagebox.showinfo(self.tr("info_title"), self.tr("msg_select_at_least_one"))
             return
 
         clips = sorted([p for p in sel if p.complete()], key=lambda x: x.key)
         if not clips:
-            messagebox.showerror("Hiba", "Ehhez válassz ✅ clip(ek)et (front MP4 + rear MP4 + front NMEA).")
+            messagebox.showerror(self.tr("error_title"), self.tr("msg_need_complete_clips_for_map"))
             return
 
         reduced = (self.quality_mode.get() == "reduced")
@@ -979,7 +1243,7 @@ class App:
         for c in clips:
             dur = c.duration_s or ffprobe_duration(self.ffprobe, c.front_mp4) or 0.0
             if dur <= 0:
-                messagebox.showerror("Hiba", f"Nem tudom a hosszát: {c.front_mp4}")
+                messagebox.showerror(self.tr("error_title"), self.tr("msg_unknown_duration", path=c.front_mp4))
                 return
             durations.append(dur)
             nmeas.append(c.front_nmea)
@@ -992,9 +1256,9 @@ class App:
         follow_tag = "FOLLOW" if follow else "FIXED"
         out_mp4 = SCRIPT_DIR / f"MAP_{mode_tag}_{start_key}_to_{end_key}_{follow_tag}_{pip_w}x{pip_h}.mp4"
 
-        busy = BusyDialog(self.root, title="Térkép videó – dolgozom…")
-        busy.set_label("Térképes videó készítése (OSM) – részletek a log fájlban")
-        busy.set_detail(f"Szegmensek: {len(clips)} | Méret: {pip_w}x{pip_h} | FPS: 5 | Hossz: {fmt_duration(total_dur)}")
+        busy = BusyDialog(self.root, title=self.tr("busy_map_title"))
+        busy.set_label(self.tr("busy_map_label"))
+        busy.set_detail(self.tr("busy_map_detail", segments=len(clips), w=pip_w, h=pip_h, duration=fmt_duration(total_dur)))
         busy.set_progress(0)
 
         self.log("=== Map video start (multi-segment) ===")
@@ -1029,26 +1293,26 @@ class App:
                 )
 
                 self.log("=== Map video done (multi-segment) ===")
-                self.root.after(0, lambda: (busy.close(), messagebox.showinfo("Kész", f"Térképes videó elkészült:\n{out_mp4}\n\nLog: {self.file_logger.latest_path}")))
+                self.root.after(0, lambda: (busy.close(), messagebox.showinfo(self.tr("done_title"), self.tr("msg_map_video_done", out_mp4=out_mp4, log=self.file_logger.latest_path))))
             except Exception as e:
                 err = str(e)
                 self.log(f"!!! Map video error (multi): {err}")
-                self.root.after(0, lambda err=err: (busy.close(), messagebox.showerror("Hiba", f"{err}\n\nLog: {self.file_logger.latest_path}")))
+                self.root.after(0, lambda err=err: (busy.close(), messagebox.showerror(self.tr("error_title"), f"{self.tr_err(err)}\n\nLog: {self.file_logger.latest_path}")))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def export_selection(self):
         sel = self.get_selected_pairs()
         if not sel:
-            messagebox.showinfo("Info", "Jelölj ki legalább 1 elemet.")
+            messagebox.showinfo(self.tr("info_title"), self.tr("msg_select_at_least_one"))
             return
 
         clips = sorted([p for p in sel if p.complete()], key=lambda x: x.key)
         if not clips:
-            messagebox.showerror("Hiba", "A kijelöltek között nincs exportálható (✅) clip.")
+            messagebox.showerror(self.tr("error_title"), self.tr("msg_no_exportable_clip"))
             return
 
-        out_dir = filedialog.askdirectory(title="Hova mentsem a végső eredményt?")
+        out_dir = filedialog.askdirectory(title=self.tr("pick_output_title"))
         if not out_dir:
             return
         out_dir = Path(out_dir)
@@ -1062,9 +1326,10 @@ class App:
         out_mp4 = out_dir / f"COMBINED_{mode_tag}_{start_key}_to_{end_key}.mp4"
         out_nmea = out_dir / f"COMBINED_{mode_tag}_{start_key}_to_{end_key}.nmea"
 
-        busy = BusyDialog(self.root, title="Export – dolgozom…")
-        busy.set_label("Export folyamat… (részletek a log fájlban)")
-        busy.set_detail(f"Mód: {'Csökkentett 720p' if reduced else 'Nativ'} | Map overlay: {'ON' if want_map else 'OFF'}")
+        busy = BusyDialog(self.root, title=self.tr("busy_export_title"))
+        busy.set_label(self.tr("busy_export_label"))
+        mode_name = self.tr("busy_export_mode_reduced") if reduced else self.tr("busy_export_mode_native")
+        busy.set_detail(self.tr("busy_export_detail", mode=mode_name, overlay="ON" if want_map else "OFF"))
         self.root.update_idletasks()
 
         self.log("=== Export start ===")
@@ -1086,7 +1351,7 @@ class App:
                 for c in clips:
                     dur = c.duration_s or ffprobe_duration(self.ffprobe, c.front_mp4) or 0.0
                     if dur <= 0:
-                        raise RuntimeError(f"Nem tudom a hosszát: {c.front_mp4}")
+                        raise RuntimeError(self.tr("msg_unknown_duration", path=c.front_mp4))
                     offsets.append(acc)
                     durations.append(dur)
                     acc += dur
@@ -1095,7 +1360,7 @@ class App:
                 # Create map video ONCE for full duration (optional)
                 map_mp4: Path | None = None
                 if want_map:
-                    self.root.after(0, lambda: (busy.set_progress(0), busy.set_detail("Map videó generálás (teljes út)…")))
+                    self.root.after(0, lambda: (busy.set_progress(0), busy.set_detail(self.tr("busy_generating_map"))))
                     pip_w, pip_h = compute_pip_size(self.ffprobe, clips[0].front_mp4, clips[0].rear_mp4, reduced=reduced)
                     map_mp4 = workdir / f"map_full_{mode_tag}_{start_key}_to_{end_key}_{pip_w}x{pip_h}.mp4"
 
@@ -1135,10 +1400,10 @@ class App:
 
                 for i, pair in enumerate(clips, start=1):
                     done = i - 1
-                    self.set_status(f"Export: overlay {i}/{total_segments} … | Log: {self.file_logger.latest_path}")
+                    self.set_status(self.tr("status_export_overlay", i=i, total=total_segments, log=self.file_logger.latest_path))
                     self.log(f"--- Overlay {i}/{total_segments}: {pair.key} ---")
 
-                    self.root.after(0, lambda i=i, ts=total_segments: busy.set_detail(f"Szegmens: {i}/{ts} (rear+map overlay)"))
+                    self.root.after(0, lambda i=i, ts=total_segments: busy.set_detail(self.tr("busy_segment", i=i, total=ts)))
 
                     seg_out = workdir / f"seg_{i:04d}_{pair.key}.mp4"
 
@@ -1160,24 +1425,24 @@ class App:
 
                     segments.append(seg_out)
 
-                self.set_status(f"Export: concat… | Log: {self.file_logger.latest_path}")
-                self.root.after(0, lambda: (busy.set_progress(96), busy.set_detail("Összefűzés (concat)…")))
+                self.set_status(self.tr("status_export_concat", log=self.file_logger.latest_path))
+                self.root.after(0, lambda: (busy.set_progress(96), busy.set_detail(self.tr("busy_concat"))))
                 concat_mp4(self.ffmpeg, segments, out_mp4, self.log)
 
-                self.set_status(f"Export: NMEA… | Log: {self.file_logger.latest_path}")
-                self.root.after(0, lambda: (busy.set_progress(98), busy.set_detail("NMEA összefűzés…")))
+                self.set_status(self.tr("status_export_nmea", log=self.file_logger.latest_path))
+                self.root.after(0, lambda: (busy.set_progress(98), busy.set_detail(self.tr("busy_nmea"))))
                 concat_nmea([p.front_nmea for p in clips if p.front_nmea], out_nmea)
 
                 self.root.after(0, lambda: busy.set_progress(100))
-                self.set_status(f"Kész! {out_mp4.name} + {out_nmea.name} | Log: {self.file_logger.latest_path}")
+                self.set_status(self.tr("status_done", mp4=out_mp4.name, nmea=out_nmea.name, log=self.file_logger.latest_path))
                 self.log("=== Export done ===")
 
-                self.root.after(0, lambda: (busy.close(), messagebox.showinfo("Kész", f"Mentve:\n{out_mp4}\n{out_nmea}\n\nLog: {self.file_logger.latest_path}")))
+                self.root.after(0, lambda: (busy.close(), messagebox.showinfo(self.tr("done_title"), self.tr("msg_export_saved", out_mp4=out_mp4, out_nmea=out_nmea, log=self.file_logger.latest_path))))
 
             except Exception as e:
                 err = str(e)
                 self.log(f"!!! Export error: {err}")
-                self.root.after(0, lambda err=err: (busy.close(), messagebox.showerror("Hiba", f"{err}\n\nLog: {self.file_logger.latest_path}")))
+                self.root.after(0, lambda err=err: (busy.close(), messagebox.showerror(self.tr("error_title"), f"{self.tr_err(err)}\n\nLog: {self.file_logger.latest_path}")))
 
         threading.Thread(target=worker, daemon=True).start()
 

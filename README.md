@@ -1,23 +1,25 @@
-# MiVue 798D + A30 – Simple GUI Exporter (WSL/Linux)
+# MiVue 798D + A30 - Simple GUI Exporter (Linux/WSL)
 
-A small Python GUI tool to work with **Mio MiVue 798D** (front) + **MiVue A30** (rear) dashcam recordings.
+A Python GUI tool for **Mio MiVue 798D** (front) + **MiVue A30** (rear) dashcam recordings.
 
 It can:
 - scan the camera SD-card folder structure,
-- combine **front + rear** videos into one MP4 with a **rear PiP overlay**,
-- generate a **moving OpenStreetMap (OSM) map video** from the front `.NMEA`,
-- optionally burn the **map video overlay** into the exported combined video,
-- concatenate multiple selected segments into one final MP4 and one combined NMEA.
+- merge **front + rear** videos into one MP4 with **rear PiP overlay**,
+- generate a **moving OpenStreetMap (OSM) map video** from front `.NMEA`,
+- optionally burn the **map overlay video** into export,
+- concatenate selected segments into one final MP4 and one combined NMEA.
 
-Works well on Linux and on **WSL2** (GUI via WSLg / X server, Firefox for HTML maps).
+Works on Linux and **WSL2** (GUI via WSLg / X server).
 
----
+## Screenshot
 
-## Folder structure expected
+![MiVue GUI Screenshot](./Screenshot.png)
+
+## Expected Folder Structure
 
 Select the **Normal/** directory (the one that contains `F/` and `R/`):
 
-```
+```text
 Normal/
   F/
     FILEYYMMDD-HHMMSSF.MP4
@@ -27,10 +29,8 @@ Normal/
 ```
 
 Notes:
-- The rear camera typically has **no NMEA** file (GPS comes from the front camera).
-- The tool matches clips by timestamp `YYMMDD-HHMMSS`.
-
----
+- Rear camera typically has **no NMEA** file (GPS comes from front).
+- Clips are matched by timestamp `YYMMDD-HHMMSS`.
 
 ## Requirements
 
@@ -47,8 +47,6 @@ sudo apt install -y ffmpeg python3 python3-pip python3-tk
 pip install folium numpy pillow
 ```
 
----
-
 ## Run
 
 ```bash
@@ -62,49 +60,48 @@ Logs:
 Map tile cache:
 - `./tiles_cache/`
 
----
+## GUI Features
 
-## GUI features
+- **Folder (Normal/)**
+  - scans clips
+  - shows complete (`✅`) and incomplete (`⚠️`) entries
+  - now includes a **scan progress dialog** with progress bar and current file detail
+- **Map HTML (selected)**
+  - creates interactive OSM HTML preview from selected NMEA tracks
+- **Map video (selected)**
+  - creates moving map overlay video (OSM tiles, 5 FPS, GPS/camera smoothing)
+- **Merge (multiple clips -> 1 MP4 + 1 NMEA)**
+  - overlays rear PiP
+  - optional map overlay during export
+  - outputs one merged MP4 + one merged NMEA
 
-### Load clips
-**Mappa (Normal/)**  
-Scans and lists clips:
-- ✅ complete (exportable)
-- ⚠️ incomplete
+## Language Support
 
-### Map HTML
-**Térkép HTML (kijelölt)**  
-Creates an interactive OpenStreetMap HTML preview.
+- UI is bilingual: **English + Hungarian**
+- Language switcher is available in the toolbar via **flag icons** (`🇬🇧` / `🇭🇺`)
+- Default language: **English**
 
-### Map video
-**Térkép videó (kijelölt)**  
-Creates a moving map video for the selected segments:
-- OSM tiles
-- Follow mode
-- 5 FPS
-- GPS + camera smoothing
-
-### Export (combine)
-**Egyesítés (több clip → 1 MP4 + 1 NMEA)**
-
----
-
-## Quality modes
+## Quality Modes
 
 ### Native
-- Original resolution
+- original resolution
 - H.264: CRF 20, veryfast
-- Audio: AAC 128k
+- audio: AAC 128k
 
 ### Reduced
-- Front scaled to 720p
+- front scaled to 720p
 - H.264: CRF 26, slow
-- Audio: AAC 64k
-
----
+- audio: AAC 64k
 
 ## Notes
 
-- GPS from front camera only
-- Designed for MiVue naming scheme
-- Personal use tool
+- GPS comes from front camera only
+- optimized for MiVue naming scheme
+- personal use tool
+
+---
+
+![Python](https://img.shields.io/badge/Python-3.x-3776AB?logo=python&logoColor=white)
+![FFmpeg](https://img.shields.io/badge/FFmpeg-required-007808?logo=ffmpeg&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL2-0A66C2)
+![GUI](https://img.shields.io/badge/GUI-Tkinter-blue)
